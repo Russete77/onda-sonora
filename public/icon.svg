@@ -1,0 +1,39 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#000000;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1a1a1a;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="iconGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#00ff88;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#00cc66;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="120" fill="url(#bgGradient)"/>
+
+  <!-- Runner figure (scaled up and centered) -->
+  <!-- Head -->
+  <circle cx="256" cy="180" r="40" fill="url(#iconGradient)"/>
+
+  <!-- Body -->
+  <path d="M 256 220 L 256 340" stroke="url(#iconGradient)" stroke-width="30" stroke-linecap="round"/>
+
+  <!-- Left arm (running position) -->
+  <path d="M 256 250 L 180 290" stroke="url(#iconGradient)" stroke-width="25" stroke-linecap="round"/>
+
+  <!-- Right arm (running position) -->
+  <path d="M 256 250 L 332 210" stroke="url(#iconGradient)" stroke-width="25" stroke-linecap="round"/>
+
+  <!-- Left leg (running position) -->
+  <path d="M 256 340 L 200 420" stroke="url(#iconGradient)" stroke-width="30" stroke-linecap="round"/>
+
+  <!-- Right leg (running position) -->
+  <path d="M 256 340 L 312 390" stroke="url(#iconGradient)" stroke-width="30" stroke-linecap="round"/>
+
+  <!-- Speed lines for dynamic effect -->
+  <line x1="120" y1="200" x2="180" y2="200" stroke="url(#iconGradient)" stroke-width="8" stroke-linecap="round" opacity="0.4"/>
+  <line x1="100" y1="250" x2="160" y2="250" stroke="url(#iconGradient)" stroke-width="8" stroke-linecap="round" opacity="0.4"/>
+  <line x1="110" y1="300" x2="170" y2="300" stroke="url(#iconGradient)" stroke-width="8" stroke-linecap="round" opacity="0.4"/>
+</svg>

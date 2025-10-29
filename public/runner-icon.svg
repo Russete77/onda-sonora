@@ -1,0 +1,44 @@
+<svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Glow effect -->
+  <defs>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <linearGradient id="runnerGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#00ff88;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#00cc66;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Outer circle glow -->
+  <circle cx="20" cy="20" r="18" fill="url(#runnerGradient)" opacity="0.3" filter="url(#glow)"/>
+
+  <!-- Main circle background -->
+  <circle cx="20" cy="20" r="16" fill="#000000" stroke="url(#runnerGradient)" stroke-width="2"/>
+
+  <!-- Runner icon -->
+  <!-- Head -->
+  <circle cx="20" cy="12" r="3" fill="url(#runnerGradient)"/>
+
+  <!-- Body -->
+  <path d="M 20 15 L 20 24" stroke="url(#runnerGradient)" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Left arm (running position) -->
+  <path d="M 20 17 L 15 20" stroke="url(#runnerGradient)" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Right arm (running position) -->
+  <path d="M 20 17 L 25 14" stroke="url(#runnerGradient)" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Left leg (running position) -->
+  <path d="M 20 24 L 16 30" stroke="url(#runnerGradient)" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Right leg (running position) -->
+  <path d="M 20 24 L 24 27" stroke="url(#runnerGradient)" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Direction indicator (arrow pointing up/forward) -->
+  <path d="M 20 2 L 23 6 L 17 6 Z" fill="url(#runnerGradient)" opacity="0.8"/>
+</svg>
