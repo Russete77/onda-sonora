@@ -74,7 +74,7 @@ export default function MiniRadar({ currentPosition, routeCoordinates, heading =
       });
 
       // Create runner marker
-      if (currentPosition) {
+      if (currentPosition && radarMap.current) {
         const el = document.createElement('div');
         el.style.width = '12px';
         el.style.height = '12px';
@@ -133,7 +133,7 @@ export default function MiniRadar({ currentPosition, routeCoordinates, heading =
     // Update or create marker
     if (radarMarker.current) {
       radarMarker.current.setLngLat(currentPosition);
-    } else {
+    } else if (radarMap.current) {
       const el = document.createElement('div');
       el.style.width = '12px';
       el.style.height = '12px';
