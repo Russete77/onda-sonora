@@ -13,10 +13,11 @@ export class KalmanFilter {
   private lng: number | null = null;
   private variance_lat: number = -1;
   private variance_lng: number = -1;
+  private lastTimestamp: number = 0;
 
-  constructor(variance = 1, minAccuracy = 1) {
-    this.variance = variance; // Process variance
-    this.minAccuracy = minAccuracy;
+  constructor(variance = 5, minAccuracy = 5) {
+    this.variance = variance; // Process variance (5 = realistic for mobile GPS)
+    this.minAccuracy = minAccuracy; // Min 5m = realistic GPS accuracy
   }
 
   /**
@@ -41,9 +42,15 @@ export class KalmanFilter {
       this.lng = lng;
       this.variance_lat = accuracy * accuracy;
       this.variance_lng = accuracy * accuracy;
+      this.lastTimestamp = timestamp || Date.now();
     } else {
-      // Kalman gain calculation
-      const timeInc = timestamp ? 1 : 1; // Could use actual time diff
+      // Kalman gain calculation with real time difference
+      let timeInc = 1;
+      if (timestamp && this.lastTimestamp) {
+        timeInc = Math.max((timestamp - this.lastTimestamp) / 1000, 0.1); // seconds, min 0.1s
+        timeInc = Math.min(timeInc, 5); // Cap at 5s to prevent huge jumps
+      }
+      this.lastTimestamp = timestamp || Date.now();
 
       this.variance_lat += timeInc * this.variance;
       this.variance_lng += timeInc * this.variance;
@@ -81,5 +88,6 @@ export class KalmanFilter {
     this.lng = null;
     this.variance_lat = -1;
     this.variance_lng = -1;
+    this.lastTimestamp = 0;
   }
 }

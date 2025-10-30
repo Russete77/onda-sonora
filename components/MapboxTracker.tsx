@@ -50,6 +50,8 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [showMenu, setShowMenu] = useState(false);
   const [showStats, setShowStats] = useState(true); // Toggle para mostrar/esconder stats durante corrida
+  const [autoFollowEnabled, setAutoFollowEnabled] = useState(true); // Auto-follow camera
+  const autoFollowTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Audio Feedback Hook
   const audioFeedback = useAudioFeedback({
@@ -120,8 +122,8 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
   const { position, error, accuracy, startTracking: startGeoTracking, stopTracking, isTracking } = useGeolocation({
     enableHighAccuracy: true,
     timeout: 5000,
-    maximumAge: 0,
-    distanceFilter: 0.2, // Update every 0.2 meter - alta precisão para capturar curvas
+    maximumAge: 1000, // 1 segundo de cache (balanceia latency e precisão)
+    distanceFilter: 5, // 5 metros - filtra ruído GPS, padrão profissional (Nike Run Club)
   });
 
   // Activity Recognition (pausa automática inteligente)
@@ -149,6 +151,13 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
 
     // Reset audio tracking
     audioFeedback.resetTracking();
+
+    // Enable auto-follow when starting tracking
+    setAutoFollowEnabled(true);
+    if (autoFollowTimerRef.current) {
+      clearTimeout(autoFollowTimerRef.current);
+      autoFollowTimerRef.current = null;
+    }
 
     // Anúncio de início
     audioFeedback.announceStart();
@@ -400,6 +409,39 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
     }
   };
 
+  // Recentralizar mapa no usuário (manual override)
+  const handleRecenter = () => {
+    if (!position || !map.current) return;
+
+    // Clear timer if exists
+    if (autoFollowTimerRef.current) {
+      clearTimeout(autoFollowTimerRef.current);
+      autoFollowTimerRef.current = null;
+    }
+
+    // Re-enable auto-follow immediately
+    setAutoFollowEnabled(true);
+
+    // Center map with animation
+    if (position.heading !== null && position.heading !== undefined) {
+      map.current.easeTo({
+        center: [position.longitude, position.latitude],
+        bearing: position.heading,
+        zoom: 18,
+        pitch: 45,
+        duration: 800,
+        essential: true,
+      });
+    } else {
+      map.current.easeTo({
+        center: [position.longitude, position.latitude],
+        zoom: 18,
+        duration: 800,
+        essential: true,
+      });
+    }
+  };
+
 
   // Initialize Mapbox
   useEffect(() => {
@@ -460,6 +502,30 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
       }),
       'top-right'
     );
+
+    // Detect user interaction with map (drag, touch, zoom)
+    const handleMapInteraction = () => {
+      if (isTracking) {
+        // Disable auto-follow when user interacts
+        setAutoFollowEnabled(false);
+
+        // Clear existing timer
+        if (autoFollowTimerRef.current) {
+          clearTimeout(autoFollowTimerRef.current);
+        }
+
+        // Re-enable auto-follow after 10 seconds of no interaction
+        autoFollowTimerRef.current = setTimeout(() => {
+          setAutoFollowEnabled(true);
+        }, 10000); // 10 seconds
+      }
+    };
+
+    map.current.on('dragstart', handleMapInteraction);
+    map.current.on('touchstart', handleMapInteraction);
+    map.current.on('zoomstart', handleMapInteraction);
+    map.current.on('pitchstart', handleMapInteraction);
+    map.current.on('rotatestart', handleMapInteraction);
 
     map.current.on('load', () => {
       // Force map resize to get correct dimensions
@@ -557,11 +623,14 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
     };
   }, []);
 
-  // Cleanup timer on unmount
+  // Cleanup timers on unmount
   useEffect(() => {
     return () => {
       if (timerIntervalRef.current) {
         clearInterval(timerIntervalRef.current);
+      }
+      if (autoFollowTimerRef.current) {
+        clearTimeout(autoFollowTimerRef.current);
       }
     };
   }, []);
@@ -663,10 +732,11 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
       }
     }
 
-    // VALIDAÇÃO: Ignorar atualização do PATH com precisão ruim (> 30m)
-    // Mas o marker ainda é mostrado para o usuário ver onde está
+    // VALIDAÇÃO SECUNDÁRIA: Accuracy muito ruim (> 30m) não adiciona ao path
+    // Nota: Validação primária (> 50m) está no useGeolocation e rejeita completamente
+    // Esta validação extra garante path super limpo
     if (posAccuracy && posAccuracy > 30) {
-      console.warn(`GPS precision too low: ${posAccuracy.toFixed(1)}m - skipping path update`);
+      console.warn(`GPS precision moderate: ${posAccuracy.toFixed(1)}m - skipping path (marker still shown)`);
       return;
     }
 
@@ -730,29 +800,31 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
       return newPathCoordinates;
     });
 
-    // Center map on user location with smooth animation
-    if (heading !== null && heading !== undefined && isTracking) {
-      map.current.easeTo({
-        center: [longitude, latitude],
-        bearing: heading,
-        zoom: 18,
-        pitch: 45,
-        duration: 1000,
-        essential: true,
-      });
-    } else {
-      map.current.easeTo({
-        center: [longitude, latitude],
-        duration: 1000,
-        essential: true,
-      });
+    // Center map on user location with smooth animation (only if auto-follow is enabled)
+    if (autoFollowEnabled) {
+      if (heading !== null && heading !== undefined && isTracking) {
+        map.current.easeTo({
+          center: [longitude, latitude],
+          bearing: heading,
+          zoom: 18,
+          pitch: 45,
+          duration: 1000,
+          essential: true,
+        });
+      } else {
+        map.current.easeTo({
+          center: [longitude, latitude],
+          duration: 1000,
+          essential: true,
+        });
+      }
     }
 
     // Callback using ref to avoid dependency issues
     if (onLocationUpdateRef.current && posAccuracy) {
       onLocationUpdateRef.current(latitude, longitude, posAccuracy);
     }
-  }, [position, mapLoaded]);
+  }, [position, mapLoaded, autoFollowEnabled, isTracking]);
 
   return (
     <div className="relative w-full h-full">
@@ -771,6 +843,20 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
           )}
         </svg>
       </button>
+
+      {/* Recenter Button - Shows when auto-follow is disabled */}
+      {isTracking && !autoFollowEnabled && position && (
+        <button
+          onClick={handleRecenter}
+          className="absolute top-6 right-6 z-[100] bg-green-500 hover:bg-green-600 backdrop-blur-md text-white font-bold p-3 rounded-xl transition-all duration-200 shadow-lg border border-green-400/40 animate-pulse"
+          title="Recentralizar no meu local"
+        >
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+          </svg>
+        </button>
+      )}
 
       {/* Slide Menu */}
       {showMenu && (

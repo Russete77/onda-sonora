@@ -77,7 +77,14 @@ export function useGeolocation(
       const rawLng = pos.coords.longitude;
       const accuracy = pos.coords.accuracy;
 
-      // Apply Kalman Filter for professional GPS smoothing
+      // CRITICAL: Reject GPS readings with poor accuracy BEFORE Kalman Filter
+      // This prevents corrupting the filter with bad data
+      if (accuracy > 50) {
+        console.warn(`GPS accuracy too low: ${accuracy.toFixed(1)}m - rejecting reading`);
+        return; // Skip this update entirely
+      }
+
+      // Apply Kalman Filter for professional GPS smoothing (only on good data)
       const filtered = kalmanFilterRef.current.process(
         rawLat,
         rawLng,
