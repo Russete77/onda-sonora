@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { KalmanFilter } from '@/utils/kalmanFilter';
 
 export interface GeolocationData {
   latitude: number;
@@ -48,10 +49,8 @@ export function useGeolocation(
   const watchIdRef = useRef<number | null>(null);
   const lastPositionRef = useRef<GeolocationData | null>(null);
 
-  // EMA smoothing for GPS coordinates (reduces jitter)
-  const smoothedLatRef = useRef<number | null>(null);
-  const smoothedLngRef = useRef<number | null>(null);
-  const SMOOTHING_FACTOR = 0.3; // 0 = no smoothing, 1 = no filtering
+  // Kalman Filter for professional-grade GPS smoothing
+  const kalmanFilterRef = useRef<KalmanFilter>(new KalmanFilter(1, 1));
 
   // Calculate distance between two coordinates using Haversine formula
   const calculateDistance = useCallback(
@@ -74,23 +73,21 @@ export function useGeolocation(
 
   const handleSuccess = useCallback(
     (pos: GeolocationPosition) => {
-      let lat = pos.coords.latitude;
-      let lng = pos.coords.longitude;
+      const rawLat = pos.coords.latitude;
+      const rawLng = pos.coords.longitude;
+      const accuracy = pos.coords.accuracy;
 
-      // Apply EMA smoothing to reduce GPS jitter
-      if (smoothedLatRef.current !== null && smoothedLngRef.current !== null) {
-        // EMA formula: smoothed = alpha * new + (1 - alpha) * previous
-        lat = SMOOTHING_FACTOR * lat + (1 - SMOOTHING_FACTOR) * smoothedLatRef.current;
-        lng = SMOOTHING_FACTOR * lng + (1 - SMOOTHING_FACTOR) * smoothedLngRef.current;
-      }
-
-      // Update smoothed values
-      smoothedLatRef.current = lat;
-      smoothedLngRef.current = lng;
+      // Apply Kalman Filter for professional GPS smoothing
+      const filtered = kalmanFilterRef.current.process(
+        rawLat,
+        rawLng,
+        accuracy,
+        pos.timestamp
+      );
 
       const newPosition: GeolocationData = {
-        latitude: lat,
-        longitude: lng,
+        latitude: filtered.lat,
+        longitude: filtered.lng,
         accuracy: pos.coords.accuracy,
         altitude: pos.coords.altitude,
         altitudeAccuracy: pos.coords.altitudeAccuracy,
@@ -179,9 +176,8 @@ export function useGeolocation(
       watchIdRef.current = null;
     }
     setIsTracking(false);
-    // Reset smoothing values
-    smoothedLatRef.current = null;
-    smoothedLngRef.current = null;
+    // Reset Kalman Filter
+    kalmanFilterRef.current.reset();
   }, []);
 
   // Cleanup on unmount

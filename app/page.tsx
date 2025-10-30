@@ -20,13 +20,13 @@ export default function Home() {
 
   return (
     <main className="h-screen w-screen overflow-hidden bg-black">
-      {/* Header - Compact - Hidden during tracking */}
+      {/* Header - Centered Logo - Hidden during tracking */}
       {!isTracking && (
         <div className="absolute top-0 left-0 right-0 z-20 pointer-events-none">
-          <div className="px-6 py-5">
-            <div className="flex items-center justify-between">
-              <div className="bg-gradient-to-r from-black/80 via-black/70 to-black/60 backdrop-blur-xl rounded-2xl px-6 py-3 border-2 border-green-500/40 shadow-xl pointer-events-auto">
-                <h1 className="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-green-400 to-green-300 tracking-tight">
+          <div className="px-6 py-6">
+            <div className="flex items-center justify-center">
+              <div className="bg-black/60 backdrop-blur-md rounded-2xl px-6 py-3 border border-white/10 pointer-events-auto">
+                <h1 className="text-xl font-bold text-white/90 tracking-wide">
                   ONDA SONORA
                 </h1>
               </div>

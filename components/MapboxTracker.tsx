@@ -3,7 +3,14 @@
 import { useEffect, useRef, useState } from 'react';
 import mapboxgl from 'mapbox-gl';
 import { useGeolocation } from '@/hooks/useGeolocation';
-import MiniRadar from './MiniRadar';
+import { useActivityRecognition } from '@/hooks/useActivityRecognition';
+import { matchRouteToRoads } from '@/utils/mapMatchingService';
+import { API_CONFIG, trackApiUsage, getApiUsageStats, isWithinFreeTier } from '@/config/apiConfig';
+import { saveRun, RunData, Split } from '@/utils/db';
+import { calculateSplits, getSplitStats } from '@/utils/splitCalculator';
+import { useAudioFeedback } from '@/hooks/useAudioFeedback';
+import RunHistory from './RunHistory';
+import RunCharts from './RunCharts';
 import 'mapbox-gl/dist/mapbox-gl.css';
 
 interface MapboxTrackerProps {
@@ -23,14 +30,36 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
   const [pathCoordinates, setPathCoordinates] = useState<[number, number][]>([]);
   const [totalDistance, setTotalDistance] = useState(0); // em metros
   const [elapsedTime, setElapsedTime] = useState(0); // em segundos
+  const [elevationGain, setElevationGain] = useState(0); // em metros
+  const [elevationLoss, setElevationLoss] = useState(0); // em metros
+  const [isProcessingRoute, setIsProcessingRoute] = useState(false);
+  const [routeMatched, setRouteMatched] = useState(false);
+  const lastElevationRef = useRef<number | null>(null);
   const startTimeRef = useRef<number | null>(null);
+  const endTimeRef = useRef<number | null>(null);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [apiUsageStats, setApiUsageStats] = useState(getApiUsageStats());
+  const [splits, setSplits] = useState<Split[]>([]);
+  const [showSummary, setShowSummary] = useState(false);
+  const [maxSpeed, setMaxSpeed] = useState(0);
+  const [showHistory, setShowHistory] = useState(false);
+  const [viewingRun, setViewingRun] = useState<RunData | null>(null);
+  const [isPausedManually, setIsPausedManually] = useState(false);
+  const pauseStartTimeRef = useRef<number | null>(null);
+  const totalPausedTimeRef = useRef<number>(0); // Total tempo pausado em ms
+  const [audioEnabled, setAudioEnabled] = useState(true);
+  const [showMenu, setShowMenu] = useState(false);
+  const [showStats, setShowStats] = useState(true); // Toggle para mostrar/esconder stats durante corrida
 
-  // Route planning states
-  const [plannedRoute, setPlannedRoute] = useState<[number, number][]>([]);
-  const [isRoutePlanned, setIsRoutePlanned] = useState(false);
-  const [selectedDistance, setSelectedDistance] = useState<number | null>(null);
-  const [isLoadingRoute, setIsLoadingRoute] = useState(false);
+  // Audio Feedback Hook
+  const audioFeedback = useAudioFeedback({
+    enabled: audioEnabled,
+    intervalKm: 1,
+    announceDistance: true,
+    announcePace: true,
+    announceTime: true,
+    announcePause: true,
+  });
 
   // Keep ref updated
   useEffect(() => {
@@ -95,47 +124,267 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
     distanceFilter: 0.2, // Update every 0.2 meter - alta precisão para capturar curvas
   });
 
-  // Custom startTracking para limpar rota planejada do mapa grande
-  const startTracking = () => {
-    // Limpa a rota planejada do MAPA GRANDE (não do radar)
-    const pathSource = map.current?.getSource('path-line') as mapboxgl.GeoJSONSource;
-    if (pathSource) {
-      pathSource.setData({
-        type: 'Feature',
-        geometry: {
-          type: 'LineString',
-          coordinates: [], // LIMPA a rota planejada
-        },
-        properties: {},
-      });
-    }
+  // Activity Recognition (pausa automática inteligente)
+  const { activityState, isPaused: autoPaused, isMoving } = useActivityRecognition(
+    position?.speed || null
+  );
 
+  // Inicia tracking (rastreamento livre)
+  const startTracking = () => {
     // Inicia o cronômetro
     startTimeRef.current = Date.now();
+    totalPausedTimeRef.current = 0;
     setElapsedTime(0);
+    setIsPausedManually(false);
+
     timerIntervalRef.current = setInterval(() => {
-      if (startTimeRef.current) {
-        setElapsedTime(Math.floor((Date.now() - startTimeRef.current) / 1000));
+      if (startTimeRef.current && !isPausedManually) {
+        const elapsed = Date.now() - startTimeRef.current - totalPausedTimeRef.current;
+        setElapsedTime(Math.floor(elapsed / 1000));
       }
     }, 1000);
 
     // Inicia o rastreamento GPS
     startGeoTracking();
+
+    // Reset audio tracking
+    audioFeedback.resetTracking();
+
+    // Anúncio de início
+    audioFeedback.announceStart();
   };
 
-  // Reset tracking data when stopping
+  // Pausa manual durante corrida
+  const handlePause = () => {
+    setIsPausedManually(true);
+    pauseStartTimeRef.current = Date.now();
+    audioFeedback.announcePause();
+  };
+
+  // Retoma corrida após pausa
+  const handleResume = () => {
+    if (pauseStartTimeRef.current) {
+      const pauseDuration = Date.now() - pauseStartTimeRef.current;
+      totalPausedTimeRef.current += pauseDuration;
+      pauseStartTimeRef.current = null;
+    }
+    setIsPausedManually(false);
+    audioFeedback.announceResume();
+  };
+
+  // Para tracking (mantém dados para análise)
   const handleStopTracking = () => {
     stopTracking();
-    setPathCoordinates([]);
-    setTotalDistance(0);
+
+    // Marca tempo de fim
+    endTimeRef.current = Date.now();
 
     // Para o cronômetro
     if (timerIntervalRef.current) {
       clearInterval(timerIntervalRef.current);
       timerIntervalRef.current = null;
     }
-    startTimeRef.current = null;
+
+    // Calcula splits
+    if (startTimeRef.current && endTimeRef.current && pathCoordinates.length > 0) {
+      const calculatedSplits = calculateSplits(
+        pathCoordinates,
+        startTimeRef.current,
+        endTimeRef.current
+      );
+      setSplits(calculatedSplits);
+    }
+
+    // Anúncio de fim
+    audioFeedback.announceStop(totalDistance / 1000, elapsedTime);
+
+    // Mostra resumo
+    setShowSummary(true);
+  };
+
+  // Processa trajeto com Map Matching API (correção profissional)
+  const matchRouteToMap = async () => {
+    // Check if API is enabled
+    if (!API_CONFIG.MAP_MATCHING.enabled) {
+      alert('⚠️ Map Matching está desabilitado.\n\nEdite config/apiConfig.ts para ativar.');
+      return;
+    }
+
+    if (pathCoordinates.length < 2) {
+      alert('Trajeto muito curto para processar');
+      return;
+    }
+
+    // Show warning about API usage
+    if (API_CONFIG.MAP_MATCHING.showWarning) {
+      const stats = getApiUsageStats();
+      const withinFreeTier = isWithinFreeTier();
+      const count = stats.mapMatching.count;
+      const limit = API_CONFIG.MAP_MATCHING.cost.freeTier;
+
+      const message = withinFreeTier
+        ? `🗺️ Map Matching API (Mapbox)\n\n` +
+          `📊 Uso este mês: ${count}/${limit.toLocaleString()} (${((count / limit) * 100).toFixed(1)}%)\n` +
+          `💰 Custo: $0 (dentro do free tier)\n\n` +
+          `Esta API corrige o trajeto para seguir ruas reais.\n\n` +
+          `Continuar?`
+        : `⚠️ ATENÇÃO: Acima do Free Tier!\n\n` +
+          `📊 Uso: ${count}/${limit.toLocaleString()}\n` +
+          `💰 Custo estimado: $${stats.mapMatching.totalCost.toFixed(2)}\n\n` +
+          `Continuar mesmo assim?`;
+
+      if (!confirm(message)) {
+        return;
+      }
+    }
+
+    const mapboxToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
+    if (!mapboxToken) return;
+
+    setIsProcessingRoute(true);
+
+    try {
+      const matched = await matchRouteToRoads(pathCoordinates, mapboxToken, {
+        overview: 'full',
+        radiuses: pathCoordinates.map(() => 25),
+      });
+
+      if (matched && matched.coordinates.length > 0) {
+        // Track API usage
+        trackApiUsage('mapMatching', 1);
+        setApiUsageStats(getApiUsageStats()); // Update stats display
+
+        // Atualiza trajeto com versão corrigida
+        setPathCoordinates(matched.coordinates);
+        setTotalDistance(matched.distance);
+        setRouteMatched(true);
+
+        // Atualiza visualização
+        const pathSource = map.current?.getSource('path-line') as mapboxgl.GeoJSONSource;
+        if (pathSource) {
+          pathSource.setData({
+            type: 'Feature',
+            geometry: {
+              type: 'LineString',
+              coordinates: matched.coordinates,
+            },
+            properties: {},
+          });
+        }
+
+        const updatedStats = getApiUsageStats();
+        alert(
+          `✅ Trajeto corrigido!\n\n` +
+          `🎯 Confiança: ${(matched.confidence * 100).toFixed(0)}%\n` +
+          `📊 Usos este mês: ${updatedStats.mapMatching.count}/${API_CONFIG.MAP_MATCHING.cost.freeTier.toLocaleString()}`
+        );
+      } else {
+        alert('❌ Não foi possível corrigir o trajeto');
+      }
+    } catch (error) {
+      console.error('Erro ao processar trajeto:', error);
+      alert('Erro ao processar trajeto');
+    } finally {
+      setIsProcessingRoute(false);
+    }
+  };
+
+  // Salva corrida no IndexedDB
+  const handleSaveRun = async () => {
+    if (!startTimeRef.current || !endTimeRef.current) {
+      alert('Erro: dados da corrida incompletos');
+      return;
+    }
+
+    try {
+      const runData: Omit<RunData, 'id'> = {
+        timestamp: startTimeRef.current,
+        date: new Date(startTimeRef.current).toLocaleString('pt-BR'),
+        duration: elapsedTime,
+        distance: totalDistance,
+        coordinates: pathCoordinates,
+        elevationGain,
+        elevationLoss,
+        averagePace: totalDistance > 0 ? (elapsedTime / 60) / (totalDistance / 1000) : 0,
+        averageSpeed: elapsedTime > 0 ? (totalDistance / 1000) / (elapsedTime / 3600) : 0,
+        maxSpeed,
+        splits,
+        routeMatched,
+      };
+
+      await saveRun(runData);
+      alert('✅ Corrida salva com sucesso!');
+      handleReset();
+    } catch (error) {
+      console.error('Erro ao salvar corrida:', error);
+      alert('❌ Erro ao salvar corrida');
+    }
+  };
+
+  // Descarta corrida e limpa dados
+  const handleDiscardRun = () => {
+    if (confirm('Descartar esta corrida? Esta ação não pode ser desfeita.')) {
+      handleReset();
+    }
+  };
+
+  // Visualiza uma corrida salva
+  const handleViewRun = (run: RunData) => {
+    setViewingRun(run);
+    setShowHistory(false);
+
+    // Renderiza o trajeto no mapa
+    if (map.current) {
+      const pathSource = map.current.getSource('path-line') as mapboxgl.GeoJSONSource;
+      if (pathSource) {
+        pathSource.setData({
+          type: 'Feature',
+          geometry: {
+            type: 'LineString',
+            coordinates: run.coordinates,
+          },
+          properties: {},
+        });
+      }
+
+      // Centra mapa no primeiro ponto
+      if (run.coordinates.length > 0) {
+        map.current.flyTo({
+          center: run.coordinates[0],
+          zoom: 15,
+          duration: 2000,
+        });
+      }
+    }
+
+    // Atualiza estados para mostrar dados
+    setPathCoordinates(run.coordinates);
+    setTotalDistance(run.distance);
+    setElapsedTime(run.duration);
+    setElevationGain(run.elevationGain);
+    setElevationLoss(run.elevationLoss);
+    setSplits(run.splits);
+    setMaxSpeed(run.maxSpeed);
+    setRouteMatched(run.routeMatched);
+    setShowSummary(true);
+  };
+
+  // Limpa dados e reinicia
+  const handleReset = () => {
+    setPathCoordinates([]);
+    setTotalDistance(0);
     setElapsedTime(0);
+    setElevationGain(0);
+    setElevationLoss(0);
+    setRouteMatched(false);
+    setSplits([]);
+    setShowSummary(false);
+    setMaxSpeed(0);
+    setIsPausedManually(false);
+    startTimeRef.current = null;
+    endTimeRef.current = null;
+    pauseStartTimeRef.current = null;
+    totalPausedTimeRef.current = 0;
 
     // Clear path on map
     const pathSource = map.current?.getSource('path-line') as mapboxgl.GeoJSONSource;
@@ -151,98 +400,6 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
     }
   };
 
-  // Create circular route from current position
-  const createCircularRoute = async (distanceKm: number) => {
-    setIsLoadingRoute(true);
-    setSelectedDistance(distanceKm);
-
-    const mapboxToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
-    if (!mapboxToken) {
-      setIsLoadingRoute(false);
-      return;
-    }
-
-    try {
-      // Get current position
-      const getCurrentPos = (): Promise<GeolocationPosition> => {
-        return new Promise((resolve, reject) => {
-          navigator.geolocation.getCurrentPosition(resolve, reject, {
-            enableHighAccuracy: true,
-            timeout: 5000,
-          });
-        });
-      };
-
-      const pos = await getCurrentPos();
-      const startLng = pos.coords.longitude;
-      const startLat = pos.coords.latitude;
-
-      // Calculate waypoints for circular route (perfect track-like loop)
-      // SEMPRE começando da posição atual do dispositivo
-      const radiusKm = distanceKm / (2 * Math.PI); // Approximate radius for desired distance
-      const numPoints = 12; // 12 waypoints for ultra-smooth circular route
-      const waypoints: [number, number][] = [];
-
-      // IMPORTANTE: Adiciona o ponto inicial (posição atual do dispositivo)
-      waypoints.push([startLng, startLat]);
-
-      // Create waypoints in perfect circle around start point
-      for (let i = 1; i <= numPoints; i++) {
-        const angle = (i / numPoints) * 2 * Math.PI;
-        const latOffset = radiusKm * Math.cos(angle) / 111; // 1 degree lat ≈ 111 km
-        const lngOffset = radiusKm * Math.sin(angle) / (111 * Math.cos((startLat * Math.PI) / 180));
-
-        waypoints.push([startLng + lngOffset, startLat + latOffset]);
-      }
-
-      // IMPORTANTE: Add ponto inicial no final para fechar o loop e voltar exatamente ao ponto de partida
-      waypoints.push([startLng, startLat]);
-
-      // Create route through waypoints
-      const coordinates = waypoints.map(w => `${w[0]},${w[1]}`).join(';');
-      const routeRes = await fetch(
-        `https://api.mapbox.com/directions/v5/mapbox/walking/${coordinates}?geometries=geojson&overview=full&access_token=${mapboxToken}`
-      );
-      const routeData = await routeRes.json();
-
-      if (routeData.routes?.[0]?.geometry?.coordinates) {
-        const routeCoords = routeData.routes[0].geometry.coordinates as [number, number][];
-        setPlannedRoute(routeCoords);
-        setIsRoutePlanned(true);
-
-        // Draw route on main map
-        const routeSource = map.current?.getSource('path-line') as mapboxgl.GeoJSONSource;
-        if (routeSource) {
-          routeSource.setData({
-            type: 'Feature',
-            geometry: {
-              type: 'LineString',
-              coordinates: routeCoords,
-            },
-            properties: {},
-          });
-        }
-
-        // Center map on start position and fit route
-        if (routeCoords.length > 1) {
-          // First center on user position
-          map.current?.setCenter([startLng, startLat]);
-
-          // Then fit bounds with padding
-          const bounds = routeCoords.reduce(
-            (bounds, coord) => bounds.extend(coord),
-            new mapboxgl.LngLatBounds(routeCoords[0], routeCoords[0])
-          );
-          map.current?.fitBounds(bounds, { padding: 80, duration: 1000 });
-        }
-      }
-    } catch (error) {
-      console.error('Erro ao criar rota:', error);
-      alert('Erro ao criar rota circular. Verifique se a localização está ativada!');
-    } finally {
-      setIsLoadingRoute(false);
-    }
-  };
 
   // Initialize Mapbox
   useEffect(() => {
@@ -282,12 +439,13 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
 
     map.current = new mapboxgl.Map({
       container: mapContainer.current,
-      style: 'mapbox://styles/mapbox/dark-v11', // Dark theme para look moderno
+      style: 'mapbox://styles/mapbox/dark-v11', // Dark theme - NIGHT RUN
       center: initialCenter,
-      zoom: 18, // Zoom bem próximo para corredor
-      pitch: 50, // 3D view angle mais acentuado
+      zoom: 18, // Zoom adequado
+      pitch: 45, // Ângulo suave e clean
       bearing: 0,
       attributionControl: false,
+      antialias: true,
     });
 
     // Add controls
@@ -336,9 +494,9 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
         },
       });
 
-      // Add path line layer with outer glow
+      // Add path line layer - minimalista e delicado
       map.current?.addLayer({
-        id: 'path-line-outer-glow',
+        id: 'path-line-glow',
         type: 'line',
         source: 'path-line',
         layout: {
@@ -346,31 +504,14 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
           'line-cap': 'round',
         },
         paint: {
-          'line-color': '#00ff88',
-          'line-width': 20,
-          'line-opacity': 0.15,
-          'line-blur': 6,
+          'line-color': '#10b981',
+          'line-width': 8,
+          'line-opacity': 0.3,
+          'line-blur': 2,
         },
       });
 
-      // Add path line layer with inner glow
-      map.current?.addLayer({
-        id: 'path-line-inner-glow',
-        type: 'line',
-        source: 'path-line',
-        layout: {
-          'line-join': 'round',
-          'line-cap': 'round',
-        },
-        paint: {
-          'line-color': '#00ff88',
-          'line-width': 15,
-          'line-opacity': 0.4,
-          'line-blur': 3,
-        },
-      });
-
-      // Add main path line layer - dentro da largura da rua
+      // Add main path line layer - linha clean
       map.current?.addLayer({
         id: 'path-line-layer',
         type: 'line',
@@ -380,9 +521,9 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
           'line-cap': 'round',
         },
         paint: {
-          'line-color': '#00ff88',
-          'line-width': 12,
-          'line-opacity': 0.95,
+          'line-color': '#10b981',
+          'line-width': 4,
+          'line-opacity': 0.9,
         },
       });
 
@@ -432,25 +573,35 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
     }
   }, [isTracking, onTrackingChange]);
 
+  // Audio announcements for distance milestones
+  useEffect(() => {
+    if (isTracking && !isPausedManually && totalDistance > 0 && elapsedTime > 0) {
+      const distanceKm = totalDistance / 1000;
+      const paceMinPerKm = elapsedTime > 0 ? (elapsedTime / 60) / distanceKm : 0;
+
+      audioFeedback.announceDistance(distanceKm, paceMinPerKm, elapsedTime);
+    }
+  }, [totalDistance, isTracking, isPausedManually, elapsedTime]);
+
   // Update position on map when GPS position changes
   useEffect(() => {
     if (!position || !map.current || !mapLoaded) return;
 
-    const { latitude, longitude, accuracy: posAccuracy, heading } = position;
+    const { latitude, longitude, accuracy: posAccuracy, heading, speed } = position;
 
-    // VALIDAÇÃO: Ignorar updates com precisão ruim (> 30m)
-    if (posAccuracy && posAccuracy > 30) {
-      console.warn(`GPS precision too low: ${posAccuracy.toFixed(1)}m - skipping update`);
-      return;
+    // Track max speed
+    if (speed !== null && speed > maxSpeed) {
+      setMaxSpeed(speed);
     }
 
-    // Criar ou atualizar marker com SETA DIRECIONAL
+    // Criar ou atualizar marker com SETA DIRECIONAL (SEMPRE, mesmo com GPS ruim)
     if (!marker.current && map.current) {
       // Criar elemento da seta
       const el = document.createElement('div');
       el.style.width = '40px';
       el.style.height = '40px';
       el.style.position = 'relative';
+      el.style.zIndex = '1000';
 
       // SVG da seta apontando para cima (será rotacionado pelo heading)
       el.innerHTML = `
@@ -473,20 +624,55 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
       marker.current = new mapboxgl.Marker({
         element: el,
         anchor: 'center',
-        rotationAlignment: 'map',
-        pitchAlignment: 'map',
       })
         .setLngLat([longitude, latitude])
-        .setRotation(heading || 0)
         .addTo(map.current);
+
+      // Aplicar rotação inicial
+      if (heading !== null && heading !== undefined) {
+        try {
+          if (typeof marker.current.setRotation === 'function') {
+            marker.current.setRotation(heading);
+          } else {
+            // Fallback: usar CSS transform
+            el.style.transform = `rotate(${heading}deg)`;
+          }
+        } catch (e) {
+          console.warn('Failed to set marker rotation:', e);
+        }
+      }
+
+      console.log('✅ Marker created at:', [longitude, latitude], 'heading:', heading);
     } else if (marker.current) {
       // Atualizar posição
       marker.current.setLngLat([longitude, latitude]);
 
-      // Rotacionar seta baseado no heading usando API do Mapbox
+      // Rotacionar seta baseado no heading
       if (heading !== null && heading !== undefined) {
-        marker.current.setRotation(heading);
+        try {
+          if (typeof marker.current.setRotation === 'function') {
+            marker.current.setRotation(heading);
+          } else {
+            // Fallback: usar CSS transform no elemento
+            const markerElement = marker.current.getElement();
+            markerElement.style.transform = `rotate(${heading}deg)`;
+          }
+        } catch (e) {
+          console.warn('Failed to update marker rotation:', e);
+        }
       }
+    }
+
+    // VALIDAÇÃO: Ignorar atualização do PATH com precisão ruim (> 30m)
+    // Mas o marker ainda é mostrado para o usuário ver onde está
+    if (posAccuracy && posAccuracy > 30) {
+      console.warn(`GPS precision too low: ${posAccuracy.toFixed(1)}m - skipping path update`);
+      return;
+    }
+
+    // NÃO registra pontos se estiver pausado manualmente
+    if (isPausedManually) {
+      return;
     }
 
     // Update accuracy circle
@@ -545,11 +731,22 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
     });
 
     // Center map on user location with smooth animation
-    map.current.easeTo({
-      center: [longitude, latitude],
-      duration: 1000,
-      essential: true,
-    });
+    if (heading !== null && heading !== undefined && isTracking) {
+      map.current.easeTo({
+        center: [longitude, latitude],
+        bearing: heading,
+        zoom: 18,
+        pitch: 45,
+        duration: 1000,
+        essential: true,
+      });
+    } else {
+      map.current.easeTo({
+        center: [longitude, latitude],
+        duration: 1000,
+        essential: true,
+      });
+    }
 
     // Callback using ref to avoid dependency issues
     if (onLocationUpdateRef.current && posAccuracy) {
@@ -561,63 +758,218 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
     <div className="relative w-full h-full">
       <div ref={mapContainer} className="w-full h-full" />
 
-      {/* Stats panel - Running metrics */}
-      {isTracking && position && (
-        <div className="absolute top-20 left-1/2 transform -translate-x-1/2 z-10 w-full max-w-md px-4">
-          <div className="bg-gradient-to-br from-black/95 via-black/90 to-black/85 backdrop-blur-xl rounded-3xl px-5 py-4 shadow-2xl border-2 border-green-500/40">
-            {/* Timer - Top row */}
-            <div className="text-center mb-3 pb-2 border-b border-white/10">
-              <div className="text-[10px] text-gray-400 uppercase tracking-wider font-bold mb-1">
-                Tempo
+      {/* Hamburger Menu Button - Top Left */}
+      <button
+        onClick={() => setShowMenu(!showMenu)}
+        className="absolute top-6 left-6 z-[100] bg-black/80 hover:bg-black/90 backdrop-blur-md text-white font-bold p-3 rounded-xl transition-all duration-200 shadow-lg border border-white/20"
+      >
+        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          {showMenu ? (
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+          ) : (
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+          )}
+        </svg>
+      </button>
+
+      {/* Slide Menu */}
+      {showMenu && (
+        <>
+          {/* Backdrop */}
+          <div
+            className="absolute inset-0 bg-black/70 backdrop-blur-sm z-[90]"
+            onClick={() => setShowMenu(false)}
+          />
+
+          {/* Menu Panel - Left Side */}
+          <div className="absolute top-0 left-0 w-72 h-full bg-black/95 backdrop-blur-xl z-[95] border-r border-white/10 overflow-y-auto">
+            <div className="p-6">
+              {/* Header */}
+              <div className="flex items-center justify-between mb-8">
+                <h2 className="text-lg font-bold text-white">Menu</h2>
+                <button
+                  onClick={() => setShowMenu(false)}
+                  className="text-white/40 hover:text-white transition-colors"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
               </div>
-              <div className="text-4xl font-black text-white leading-none tracking-tight">
+
+              {/* Audio Control */}
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-3">
+                    <svg className="w-5 h-5 text-white/60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                    </svg>
+                    <span className="text-sm text-white">Áudio</span>
+                  </div>
+                  <button
+                    onClick={() => setAudioEnabled(!audioEnabled)}
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                      audioEnabled ? 'bg-green-500' : 'bg-white/20'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                        audioEnabled ? 'translate-x-5' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+                {audioFeedback.isSpeaking && (
+                  <div className="text-xs text-green-400">Falando...</div>
+                )}
+              </div>
+
+              <div className="h-px bg-white/10 mb-4"></div>
+
+              {/* Stats Toggle (durante corrida) */}
+              {isTracking && (
+                <>
+                  <div className="mb-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <svg className="w-5 h-5 text-white/60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                        </svg>
+                        <span className="text-sm text-white">Stats</span>
+                      </div>
+                      <button
+                        onClick={() => setShowStats(!showStats)}
+                        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                          showStats ? 'bg-green-500' : 'bg-white/20'
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                            showStats ? 'translate-x-5' : 'translate-x-1'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  </div>
+                  <div className="h-px bg-white/10 mb-4"></div>
+                </>
+              )}
+
+              {/* API Usage */}
+              {API_CONFIG.MAP_MATCHING.enabled && (
+                <>
+                  <div className="mb-4">
+                    <div className="flex items-center gap-3 mb-3">
+                      <svg className="w-5 h-5 text-white/60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                      </svg>
+                      <span className="text-sm text-white">API Usage</span>
+                    </div>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs text-white/40">Map Matching</span>
+                      <span className="text-xs text-white">
+                        {apiUsageStats.mapMatching.count}/{(API_CONFIG.MAP_MATCHING.cost.freeTier / 1000).toFixed(0)}K
+                      </span>
+                    </div>
+                    <div className="w-full bg-white/10 rounded-full h-1">
+                      <div
+                        className="h-1 rounded-full bg-green-500 transition-all"
+                        style={{
+                          width: `${Math.min(
+                            (apiUsageStats.mapMatching.count / API_CONFIG.MAP_MATCHING.cost.freeTier) * 100,
+                            100
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <div className="h-px bg-white/10 mb-4"></div>
+                </>
+              )}
+
+              {/* History Button */}
+              {!isTracking && !showSummary && (
+                <button
+                  onClick={() => {
+                    setShowHistory(true);
+                    setShowMenu(false);
+                  }}
+                  className="w-full bg-white/10 hover:bg-white/20 text-white px-4 py-3 rounded-xl transition-all flex items-center gap-3 text-sm border border-white/10"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <span>Histórico</span>
+                </button>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* History Modal */}
+      {showHistory && (
+        <RunHistory
+          onClose={() => setShowHistory(false)}
+          onViewRun={handleViewRun}
+        />
+      )}
+
+      {/* Paused Banner */}
+      {isTracking && isPausedManually && (
+        <div className="absolute top-20 left-1/2 transform -translate-x-1/2 z-20 w-full max-w-md px-4">
+          <div className="bg-black/80 backdrop-blur-md rounded-xl px-6 py-3 border border-white/20">
+            <div className="text-center text-white text-sm">
+              Pausado
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Stats panel - Running metrics */}
+      {isTracking && position && !isPausedManually && showStats && (
+        <div className="absolute top-20 left-1/2 transform -translate-x-1/2 z-10 w-full max-w-sm px-4">
+          <div className="bg-black/80 backdrop-blur-md rounded-xl px-4 py-3 border border-white/10">
+            {/* Timer */}
+            <div className="text-center mb-3 pb-3 border-b border-white/10">
+              <div className="text-3xl font-bold text-white">
                 {formatTime(elapsedTime)}
               </div>
             </div>
 
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-3 gap-3 text-center">
               {/* Distance */}
-              <div className="text-center">
-                <div className="text-[9px] text-gray-400 uppercase tracking-wider font-bold mb-1.5">
-                  Distância
-                </div>
-                <div className="text-2xl font-black text-green-400 leading-none mb-0.5">
+              <div>
+                <div className="text-xs text-white/40 mb-1">Distância</div>
+                <div className="text-lg font-bold text-white">
                   {(totalDistance / 1000).toFixed(2)}
                 </div>
-                <div className="text-[10px] text-green-400/60 font-semibold">km</div>
               </div>
 
               {/* Pace */}
-              <div className="text-center border-x-2 border-white/20">
-                <div className="text-[9px] text-gray-400 uppercase tracking-wider font-bold mb-1.5">
-                  Pace
+              <div>
+                <div className="text-xs text-white/40 mb-1">Pace</div>
+                <div className="text-lg font-bold text-white">
+                  {position.speed !== null ? calculatePace(position.speed) : '--:--'}
                 </div>
-                <div className="text-2xl font-black text-blue-400 leading-none mb-0.5">
-                  {position.speed !== null
-                    ? calculatePace(position.speed)
-                    : '--:--'}
-                </div>
-                <div className="text-[10px] text-blue-400/60 font-semibold">min/km</div>
               </div>
 
               {/* Speed */}
-              <div className="text-center">
-                <div className="text-[9px] text-gray-400 uppercase tracking-wider font-bold mb-1.5">
-                  Velocidade
+              <div>
+                <div className="text-xs text-white/40 mb-1">Vel</div>
+                <div className="text-lg font-bold text-white">
+                  {position.speed !== null ? (position.speed * 3.6).toFixed(1) : '0'}
                 </div>
-                <div className="text-2xl font-black text-purple-400 leading-none mb-0.5">
-                  {position.speed !== null ? (position.speed * 3.6).toFixed(1) : '0.0'}
-                </div>
-                <div className="text-[10px] text-purple-400/60 font-semibold">km/h</div>
               </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* GPS Accuracy indicator - Enhanced */}
-      {isTracking && accuracy && (
+      {/* GPS Accuracy indicator - Enhanced (só mostra se stats estiver visível) */}
+      {isTracking && accuracy && showStats && (
         <div className="absolute top-20 right-6 z-10">
+
           <div className={`backdrop-blur-md rounded-xl px-3 py-2 shadow-lg border-2 ${
             accuracy < 10
               ? 'bg-green-500/20 border-green-500/60'
@@ -658,154 +1010,200 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
         </div>
       )}
 
-      {/* Mini Radar - Shows during tracking */}
-      {isTracking && position && (
-        <div className="absolute bottom-24 right-8 z-10">
-          <MiniRadar
-            currentPosition={[position.longitude, position.latitude]}
-            routeCoordinates={plannedRoute.length > 0 ? plannedRoute : pathCoordinates}
-            heading={position.heading || 0}
-          />
-        </div>
-      )}
+      {/* Summary Screen - Post Run */}
+      {showSummary && pathCoordinates.length > 0 && (
+        <div className="absolute inset-0 bg-black/95 z-50 overflow-y-auto">
+          <div className="max-w-2xl mx-auto p-6">
+            <h2 className="text-xl font-bold text-white mb-6 text-center">Resumo da Corrida</h2>
 
-      {/* Control panel */}
-      <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 z-10 max-w-lg w-full px-4">
-        {!isTracking ? (
-          <div className="space-y-3">
-            {/* Route planning - Clean design */}
-            {!isRoutePlanned ? (
-              <div className="bg-black/70 backdrop-blur-lg rounded-2xl px-5 py-4 shadow-xl border border-white/10">
-                <div className="text-center mb-3">
-                  <p className="text-xs text-gray-400 uppercase tracking-wider font-semibold">
-                    Escolha a distância
-                  </p>
+            {/* Main Stats */}
+            <div className="grid grid-cols-3 gap-4 mb-6">
+              <div className="bg-white/5 border border-white/10 rounded-xl p-4 text-center">
+                <div className="text-xs text-white/40 uppercase mb-1">Distância</div>
+                <div className="text-2xl font-bold text-white">{(totalDistance / 1000).toFixed(2)}</div>
+                <div className="text-xs text-white/40">km</div>
+              </div>
+              <div className="bg-white/5 border border-white/10 rounded-xl p-4 text-center">
+                <div className="text-xs text-white/40 uppercase mb-1">Tempo</div>
+                <div className="text-2xl font-bold text-white">{formatTime(elapsedTime)}</div>
+                <div className="text-xs text-white/40">hh:mm:ss</div>
+              </div>
+              <div className="bg-white/5 border border-white/10 rounded-xl p-4 text-center">
+                <div className="text-xs text-white/40 uppercase mb-1">Pace Médio</div>
+                <div className="text-2xl font-bold text-white">
+                  {totalDistance > 0 ? calculatePace((totalDistance / elapsedTime)) : '--:--'}
                 </div>
-                <div className="grid grid-cols-3 gap-2">
-                  {[5, 10, 15].map((km) => (
-                    <button
-                      key={km}
-                      onClick={() => createCircularRoute(km)}
-                      disabled={isLoadingRoute}
-                      className={`${
-                        selectedDistance === km
-                          ? 'bg-green-500 border-green-400'
-                          : 'bg-white/5 border-white/20 hover:bg-white/10'
-                      } ${
-                        isLoadingRoute ? 'opacity-50 cursor-wait' : ''
-                      } border-2 rounded-xl py-4 transition-all duration-200`}
-                    >
-                      <div className="text-2xl font-black text-white">{km}</div>
-                      <div className="text-xs text-gray-400 font-semibold">km</div>
-                    </button>
-                  ))}
-                </div>
-                {isLoadingRoute && (
-                  <div className="flex items-center justify-center gap-2 mt-3">
-                    <div className="animate-spin rounded-full h-4 w-4 border-t-2 border-b-2 border-green-500"></div>
-                    <span className="text-xs text-gray-400">Criando rota...</span>
+                <div className="text-xs text-white/40">min/km</div>
+              </div>
+            </div>
+
+            {/* Secondary Stats */}
+            <div className="grid grid-cols-2 gap-4 mb-6">
+              <div className="bg-white/5 border border-white/10 rounded-xl p-3">
+                <div className="text-xs text-white/40 mb-1">Velocidade Máxima</div>
+                <div className="text-lg font-bold text-white">{(maxSpeed * 3.6).toFixed(1)} km/h</div>
+              </div>
+              <div className="bg-white/5 border border-white/10 rounded-xl p-3">
+                <div className="text-xs text-white/40 mb-1">Ganho de Elevação</div>
+                <div className="text-lg font-bold text-white">{elevationGain.toFixed(0)} m</div>
+              </div>
+            </div>
+
+            {/* Splits */}
+            {splits.length > 0 && (
+              <>
+                <div className="mb-6">
+                  <h3 className="text-lg font-bold text-white mb-3">Splits por KM</h3>
+                  <div className="bg-white/5 border border-white/10 rounded-xl overflow-hidden">
+                    <div className="grid grid-cols-3 gap-2 p-3 bg-white/5 border-b border-white/10 text-xs text-white/40 uppercase font-bold">
+                      <div>KM</div>
+                      <div className="text-center">Tempo</div>
+                      <div className="text-right">Pace</div>
+                    </div>
+                    {splits.map((split, idx) => {
+                      const splitStats = getSplitStats(splits);
+                      const isBest = split.km === splitStats.bestKm;
+                      const isWorst = split.km === splitStats.worstKm;
+
+                      return (
+                        <div
+                          key={idx}
+                          className={`grid grid-cols-3 gap-2 p-3 border-b border-white/5 ${
+                            isBest ? 'bg-green-500/10' : isWorst ? 'bg-red-500/10' : ''
+                          }`}
+                        >
+                          <div className="text-white text-sm">
+                            KM {split.km}
+                          </div>
+                          <div className="text-center text-white/60 text-sm">
+                            {Math.floor(split.time / 60)}:{(split.time % 60).toFixed(0).padStart(2, '0')}
+                          </div>
+                          <div className={`text-right text-sm ${
+                            isBest ? 'text-green-400' : isWorst ? 'text-red-400' : 'text-white'
+                          }`}>
+                            {split.pace}
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
-                )}
-              </div>
-            ) : (
-              <div className="bg-black/70 backdrop-blur-lg rounded-2xl px-5 py-3 shadow-xl border border-green-500/30 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <svg
-                    className="w-5 h-5 text-green-400"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
-                    />
-                  </svg>
-                  <span className="text-sm text-white font-semibold">
-                    Rota de {selectedDistance}km planejada
-                  </span>
                 </div>
-                <button
-                  onClick={() => {
-                    setIsRoutePlanned(false);
-                    setSelectedDistance(null);
-                    setPlannedRoute([]);
-                    const routeSource = map.current?.getSource('path-line') as mapboxgl.GeoJSONSource;
-                    if (routeSource) {
-                      routeSource.setData({
-                        type: 'Feature',
-                        geometry: { type: 'LineString', coordinates: [] },
-                        properties: {},
-                      });
-                    }
-                  }}
-                  className="text-xs text-red-400 hover:text-red-300 font-semibold"
-                >
-                  Refazer
-                </button>
-              </div>
+
+                {/* Charts */}
+                <div className="mb-6">
+                  <RunCharts splits={splits} />
+                </div>
+              </>
             )}
 
-            {/* Start button */}
-            <div className="flex justify-center">
+            {/* Action Buttons */}
+            <div className="flex gap-3 mb-4">
               <button
-                onClick={startTracking}
-                className="bg-gradient-to-r from-green-500 to-green-600 hover:from-green-600 hover:to-green-700 text-white font-bold px-8 py-3 rounded-2xl transition-all duration-200 shadow-lg hover:shadow-green-500/50 flex items-center gap-2"
+                onClick={matchRouteToMap}
+                disabled={isProcessingRoute || routeMatched}
+                className={`flex-1 ${routeMatched ? 'bg-white/10 border-green-500/40' : 'bg-white/10 hover:bg-white/20 border-white/20'} ${isProcessingRoute ? 'opacity-50 cursor-wait' : ''} text-white px-6 py-3 rounded-xl transition-all border text-sm flex items-center justify-center gap-2`}
               >
-                <svg
-                  className="w-5 h-5"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"
-                  />
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                  />
+                {isProcessingRoute ? (
+                  <>
+                    <div className="animate-spin rounded-full h-4 w-4 border-t-2 border-b-2 border-white"></div>
+                  </>
+                ) : routeMatched ? (
+                  <>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                    </svg>
+                    Trajeto Corrigido
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                    </svg>
+                    Corrigir Trajeto
+                  </>
+                )}
+              </button>
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={handleSaveRun}
+                className="flex-1 bg-white/10 hover:bg-white/20 text-white px-6 py-3 rounded-xl transition-all border border-green-500/40 text-sm flex items-center justify-center gap-2"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
                 </svg>
-                Iniciar Corrida
+                Salvar Corrida
+              </button>
+              <button
+                onClick={handleDiscardRun}
+                className="flex-1 bg-white/10 hover:bg-white/20 text-white px-6 py-3 rounded-xl transition-all border border-red-500/40 text-sm flex items-center justify-center gap-2"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+                Descartar
               </button>
             </div>
           </div>
-        ) : (
-          <div className="flex justify-center">
+        </div>
+      )}
+
+      {/* Control panel - Advanced */}
+      <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 z-10">
+        {isTracking ? (
+          // Durante corrida: botões Pausar/Retomar e Parar
+          <div className="flex gap-3">
+            {isPausedManually ? (
+              // Botão Retomar
+              <button
+                onClick={handleResume}
+                className="bg-black/80 hover:bg-black/90 backdrop-blur-md text-white px-6 py-3 rounded-xl transition-all border border-green-500/40 flex items-center gap-2 text-sm"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                Retomar
+              </button>
+            ) : (
+              // Botão Pausar
+              <button
+                onClick={handlePause}
+                className="bg-black/80 hover:bg-black/90 backdrop-blur-md text-white px-6 py-3 rounded-xl transition-all border border-white/20 flex items-center gap-2 text-sm"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                Pausar
+              </button>
+            )}
+
+            {/* Botão Parar */}
             <button
               onClick={handleStopTracking}
-              className="bg-gradient-to-r from-red-500 to-red-600 hover:from-red-600 hover:to-red-700 text-white font-bold px-8 py-3 rounded-2xl transition-all duration-200 shadow-lg hover:shadow-red-500/50 flex items-center gap-2"
+              className="bg-black/80 hover:bg-black/90 backdrop-blur-md text-white px-6 py-3 rounded-xl transition-all border border-red-500/40 flex items-center gap-2 text-sm"
             >
-              <svg
-                className="w-5 h-5"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                />
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"
-                />
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
               </svg>
-              Parar Corrida
+              Parar
             </button>
           </div>
-        )}
+        ) : !showSummary && pathCoordinates.length === 0 ? (
+          // Início: botão Iniciar
+          <button
+            onClick={startTracking}
+            className="bg-black/80 hover:bg-black/90 backdrop-blur-md text-white px-8 py-3 rounded-xl transition-all border border-green-500/40 flex items-center gap-2 text-sm"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Iniciar Corrida
+          </button>
+        ) : null}
       </div>
 
       {/* Error display */}
