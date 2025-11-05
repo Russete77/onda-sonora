@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import mapboxgl from 'mapbox-gl';
 import { useGeolocation } from '@/hooks/useGeolocation';
 import { useActivityRecognition } from '@/hooks/useActivityRecognition';
-import { matchRouteToRoads } from '@/utils/mapMatchingService';
+import { matchRouteToRoadsBatched } from '@/utils/mapMatchingService';
 import { API_CONFIG, trackApiUsage, getApiUsageStats, isWithinFreeTier } from '@/config/apiConfig';
 import { saveRun, RunData, Split } from '@/utils/db';
 import { calculateSplits, getSplitStats } from '@/utils/splitCalculator';
@@ -52,6 +52,10 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
   const [showStats, setShowStats] = useState(true); // Toggle para mostrar/esconder stats durante corrida
   const [autoFollowEnabled, setAutoFollowEnabled] = useState(true); // Auto-follow camera
   const autoFollowTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // STRAVA-GRADE: Smooth pace via média móvel (elimina oscilações)
+  const speedHistoryRef = useRef<number[]>([]);
+  const [smoothPace, setSmoothPace] = useState<string>('--:--');
 
   // Audio Feedback Hook
   const audioFeedback = useAudioFeedback({
@@ -118,11 +122,11 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
     return `${minutes}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // Hook de geolocalização com configurações otimizadas
+  // Hook de geolocalização com configurações otimizadas (Strava-grade)
   const { position, error, accuracy, startTracking: startGeoTracking, stopTracking, isTracking } = useGeolocation({
     enableHighAccuracy: true,
     timeout: 5000,
-    maximumAge: 1000, // 1 segundo de cache (balanceia latency e precisão)
+    maximumAge: 0, // ZERO cache - dados sempre frescos (Strava/Nike Run standard)
     distanceFilter: 5, // 5 metros - filtra ruído GPS, padrão profissional (Nike Run Club)
   });
 
@@ -138,6 +142,16 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
     totalPausedTimeRef.current = 0;
     setElapsedTime(0);
     setIsPausedManually(false);
+
+    // STRAVA-GRADE: Reset all tracking metrics
+    lastElevationRef.current = null;
+    setElevationGain(0);
+    setElevationLoss(0);
+    speedHistoryRef.current = [];
+    setSmoothPace('--:--');
+    setPathCoordinates([]);
+    setTotalDistance(0);
+    setMaxSpeed(0);
 
     timerIntervalRef.current = setInterval(() => {
       if (startTimeRef.current && !isPausedManually) {
@@ -193,6 +207,13 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
       clearInterval(timerIntervalRef.current);
       timerIntervalRef.current = null;
     }
+
+    // Reset elevation tracking
+    lastElevationRef.current = null;
+
+    // Reset smooth pace
+    speedHistoryRef.current = [];
+    setSmoothPace('--:--');
 
     // Calcula splits
     if (startTimeRef.current && endTimeRef.current && pathCoordinates.length > 0) {
@@ -253,14 +274,13 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
     setIsProcessingRoute(true);
 
     try {
-      const matched = await matchRouteToRoads(pathCoordinates, mapboxToken, {
-        overview: 'full',
-        radiuses: pathCoordinates.map(() => 25),
-      });
+      // STRAVA-GRADE: Batching inteligente processa rotas de QUALQUER tamanho
+      const matched = await matchRouteToRoadsBatched(pathCoordinates, mapboxToken);
 
       if (matched && matched.coordinates.length > 0) {
-        // Track API usage
-        trackApiUsage('mapMatching', 1);
+        // Track API usage (conta cada batch se houver)
+        const batchCount = Math.ceil(pathCoordinates.length / 90);
+        trackApiUsage('mapMatching', batchCount);
         setApiUsageStats(getApiUsageStats()); // Update stats display
 
         // Atualiza trajeto com versão corrigida
@@ -656,11 +676,72 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
   useEffect(() => {
     if (!position || !map.current || !mapLoaded) return;
 
-    const { latitude, longitude, accuracy: posAccuracy, heading, speed } = position;
+    const { latitude, longitude, accuracy: posAccuracy, heading, speed, altitude, altitudeAccuracy } = position;
 
     // Track max speed
     if (speed !== null && speed > maxSpeed) {
       setMaxSpeed(speed);
+    }
+
+    // STRAVA-GRADE: Smooth pace via média móvel de 10 leituras
+    // Elimina oscilações bruscas do pace instantâneo
+    if (speed !== null && speed >= 2.0) { // Só quando correndo (>= 2 m/s)
+      // Adiciona speed ao histórico
+      speedHistoryRef.current.push(speed);
+
+      // Mantém apenas últimas 10 leituras (10s @ 1Hz GPS)
+      if (speedHistoryRef.current.length > 10) {
+        speedHistoryRef.current.shift();
+      }
+
+      // Calcula média móvel
+      const avgSpeed = speedHistoryRef.current.reduce((sum, s) => sum + s, 0) / speedHistoryRef.current.length;
+
+      // Converte para pace (min/km)
+      const speedKmh = avgSpeed * 3.6;
+      const paceMinPerKm = 60 / speedKmh;
+
+      // Validação: pace realista (3:00 - 10:00 min/km)
+      if (paceMinPerKm >= 3 && paceMinPerKm <= 10) {
+        const minutes = Math.floor(paceMinPerKm);
+        const seconds = Math.floor((paceMinPerKm - minutes) * 60);
+        setSmoothPace(`${minutes}:${seconds.toString().padStart(2, '0')}`);
+      }
+    } else {
+      // Parado ou andando: limpa histórico e pace
+      speedHistoryRef.current = [];
+      setSmoothPace('--:--');
+    }
+
+    // STRAVA-GRADE: Elevação via GPS altitude nativa
+    // Precisão: ±5-15m (suficiente para corrida)
+    // Threshold: 2m para filtrar ruído GPS vertical
+    if (altitude !== null && isTracking && !isPausedManually) {
+      // Validação: altitude accuracy (se disponível)
+      const altitudeReliable = altitudeAccuracy === null || altitudeAccuracy < 30;
+
+      if (altitudeReliable) {
+        if (lastElevationRef.current !== null) {
+          const elevationDelta = altitude - lastElevationRef.current;
+
+          // Threshold de 2m para filtrar ruído GPS vertical
+          // GPS altitude é ruidoso (~5-10m), então ignoramos mudanças pequenas
+          if (elevationDelta > 2) {
+            // Ganho de elevação (subindo)
+            setElevationGain(prev => prev + elevationDelta);
+            console.log(`[Elevation] Gain: +${elevationDelta.toFixed(1)}m at ${altitude.toFixed(1)}m`);
+          } else if (elevationDelta < -2) {
+            // Perda de elevação (descendo)
+            setElevationLoss(prev => prev + Math.abs(elevationDelta));
+            console.log(`[Elevation] Loss: ${elevationDelta.toFixed(1)}m at ${altitude.toFixed(1)}m`);
+          }
+        }
+
+        // Atualiza última elevação
+        lastElevationRef.current = altitude;
+      } else {
+        console.warn(`[Elevation] Poor altitude accuracy: ${altitudeAccuracy?.toFixed(1)}m - skipping`);
+      }
     }
 
     // Criar ou atualizar marker com SETA DIRECIONAL (SEMPRE, mesmo com GPS ruim)
@@ -1032,11 +1113,11 @@ export default function MapboxTracker({ onLocationUpdate, onTrackingChange }: Ma
                 </div>
               </div>
 
-              {/* Pace */}
+              {/* Pace (STRAVA-GRADE: Smooth via média móvel) */}
               <div>
                 <div className="text-xs text-white/40 mb-1">Pace</div>
                 <div className="text-lg font-bold text-white">
-                  {position.speed !== null ? calculatePace(position.speed) : '--:--'}
+                  {smoothPace}
                 </div>
               </div>
 

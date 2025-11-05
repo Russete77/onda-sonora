@@ -76,12 +76,58 @@ export function useGeolocation(
       const rawLat = pos.coords.latitude;
       const rawLng = pos.coords.longitude;
       const accuracy = pos.coords.accuracy;
+      const speed = pos.coords.speed || 0;
 
-      // CRITICAL: Reject GPS readings with poor accuracy BEFORE Kalman Filter
+      // ============================================================
+      // STRAVA-GRADE GPS VALIDATION CASCADE
+      // All validations BEFORE Kalman Filter to prevent corruption
+      // ============================================================
+
+      // VALIDATION #1: Coordinates within Earth bounds
+      if (rawLat < -90 || rawLat > 90 || rawLng < -180 || rawLng > 180) {
+        console.error(`[GPS] Invalid coordinates: lat=${rawLat}, lng=${rawLng} - REJECTED`);
+        return;
+      }
+
+      // VALIDATION #2: Speed sanity check (Usain Bolt max = 12.4 m/s)
+      // Realistic running max: 12 m/s (43.2 km/h)
+      if (speed > 12) {
+        console.warn(`[GPS] Unrealistic speed: ${speed.toFixed(1)} m/s (${(speed * 3.6).toFixed(1)} km/h) - REJECTED`);
+        return;
+      }
+
+      // VALIDATION #3: GPS jump detection (teleportation check)
+      // Detects instantaneous position jumps > 100m that violate physics
+      if (lastPositionRef.current && pos.timestamp > 0) {
+        const timeDelta = (pos.timestamp - lastPositionRef.current.timestamp) / 1000; // seconds
+
+        if (timeDelta > 0.1) { // Only check if time actually passed
+          const distance = calculateDistance(
+            lastPositionRef.current.latitude,
+            lastPositionRef.current.longitude,
+            rawLat,
+            rawLng
+          );
+
+          // Implied speed from position change
+          const impliedSpeed = distance / timeDelta;
+
+          // Reject if implies speed > 15 m/s (54 km/h) - allows brief GPS noise
+          if (impliedSpeed > 15) {
+            console.warn(
+              `[GPS] Jump detected: ${distance.toFixed(0)}m in ${timeDelta.toFixed(1)}s ` +
+              `(${impliedSpeed.toFixed(1)} m/s = ${(impliedSpeed * 3.6).toFixed(1)} km/h) - REJECTED`
+            );
+            return;
+          }
+        }
+      }
+
+      // VALIDATION #4: Accuracy threshold (Strava uses 50m)
       // This prevents corrupting the filter with bad data
       if (accuracy > 50) {
-        console.warn(`GPS accuracy too low: ${accuracy.toFixed(1)}m - rejecting reading`);
-        return; // Skip this update entirely
+        console.warn(`[GPS] Poor accuracy: ${accuracy.toFixed(1)}m - REJECTED`);
+        return;
       }
 
       // Apply Kalman Filter for professional GPS smoothing (only on good data)
